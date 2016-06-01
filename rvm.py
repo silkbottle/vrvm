@@ -1,5 +1,6 @@
 import numpy as np
 import scipy.optimize as scopt
+from scipy.misc import logsumexp
 from sklearn.linear_model.base import BaseEstimator
 from sklearn.metrics.pairwise import (
     linear_kernel,
@@ -25,6 +26,7 @@ class RVM(BaseEstimator):
         tol=1e-3,
         threshold_alpha=1e9,
         bias_used=True,
+        fast_opt=True,
         verbose=False
     ):
         """Copy params to object properties, no validation."""
@@ -36,6 +38,7 @@ class RVM(BaseEstimator):
         self.tol = tol
         self.threshold_alpha = threshold_alpha
         self.bias_used = bias_used
+        self.fast_opt = fast_opt
         self.verbose = verbose
 
         self.upper_bound = np.zeros(n_iter)
@@ -51,6 +54,7 @@ class RVM(BaseEstimator):
             'tol': self.tol,
             'threshold_alpha': self.threshold_alpha,
             'bias_used': self.bias_used,
+            'fast_opt': self.fast_opt,
             'verbose': self.verbose
         }
         return params
@@ -97,15 +101,62 @@ class RVM(BaseEstimator):
             return np.log(1 + np.exp(-X.dot(w))).sum() + 0.5 * (self.alpha_ * w * w).sum()
 
         def gradient(w):
-            ret = -self.alpha_ * w
-            num = np.exp(-X.dot(w)) / (1. + np.exp(-X.dot(w)))
-            ret += (np.multiply(num.reshape(-1, 1), X)).sum()
-            return -ret
+            ret = self.alpha_ * w
+            z = X.dot(w)
+            num = np.zeros(z.shape)
+            num[z > 0] = np.exp(-z[z > 0]) / (1. + np.exp(-z[z > 0]))
+            num[z <= 0] = 1. / (1. + np.exp(z[z <= 0]))
+            ret -= (np.multiply(num.reshape(-1, 1), X)).sum(axis=0)
+            return ret
 
-        wmp = scopt.minimize(cost, self.mu_, method='BFGS', jac=gradient)['x']
-        self.l = np.exp(-X.dot(wmp)) / (1. + np.exp(-X.dot(wmp)))
+        result = scopt.minimize(cost, self.mu_, method='BFGS', jac=gradient, tol=1e-3, options={'maxiter': 100})
+        wmp = result['x']
+        z = X.dot(wmp)
+        self.l = np.zeros(z.shape)
+        self.l[z > 0] = np.exp(-z[z > 0]) / (1. + np.exp(-z[z > 0]))
+        self.l[z <= 0] = 1. / (1. + np.exp(z[z <= 0]))
         self.w_ = wmp 
         return -cost(wmp)
+
+    def evidence(self, n_points=10, n_epoch=10):
+        sigma_inv = np.linalg.inv(self.sigma_)
+        results = np.zeros(n_epoch)
+        for epoch in xrange(n_epoch):
+            ret = 0.5 * np.log(self.alpha_).sum()
+            ret += np.log(np.diag(np.linalg.cholesky(self.sigma_))).sum()
+            samples = np.random.multivariate_normal(self.mu_, self.sigma_, n_points)
+            X = self.y.reshape(-1, 1) * self.phi_
+            logs = np.zeros(n_points)
+            for i in xrange(n_points):
+                logs[i] = -.5 * samples[i].T.dot(self.alpha_ * samples[i])
+                logs[i] -= np.log(1. + np.exp(-X.dot(samples[i]))).sum()
+                logs[i] += .5 * (samples[i] - self.mu_).T.dot(sigma_inv).dot(samples[i] - self.mu_)
+                # print logs[i]
+            ret += logsumexp(logs)
+            ret -= np.log(1. * n_points)
+            results[epoch] = ret
+
+        return results.mean(), results.std()
+
+    def upper_bound_mc(self, n_points=10, n_epoch=10):
+        sigma_inv = np.linalg.inv(self.sigma_)
+        results = np.zeros(n_epoch)
+        for epoch in xrange(n_epoch):
+            ret = 0.5 * np.log(self.alpha_).sum()
+            ret += np.log(np.diag(np.linalg.cholesky(self.sigma_))).sum()
+            samples = np.random.multivariate_normal(self.mu_, self.sigma_, n_points)
+            X = self.y.reshape(-1, 1) * self.phi_
+            logs = np.zeros(n_points)
+            for i in xrange(n_points):
+                logs[i] = -.5 * samples[i].T.dot(self.alpha_ * samples[i])
+                logs[i] -= np.log(1. + np.exp(-X.dot(samples[i]))).sum()
+                logs[i] += .5 * (samples[i] - self.mu_).T.dot(sigma_inv).dot(samples[i] - self.mu_)
+                # print logs[i]
+            ret += logsumexp(2. * logs)
+            ret -= np.log(1. * n_points)
+            results[epoch] = ret / 2.
+
+        return results.mean(), results.std()
 
     # def _upper_bound(self):
 
@@ -169,6 +220,7 @@ class RVM(BaseEstimator):
                 ret -= f(ksi[i]) * (self.phi_[i].dot(self.mu_) ** 2 + self.phi_[i].dot(S).T.dot(self.phi_[i]))
             ret += 0.5 * self.mu_.dot(self.phi_.T.dot(y))
             ret -= 0.5 * ((self.mu_ * self.mu_ + np.diagonal(S)) * self.alpha_).sum()
+            # print 'strange', 0.5 * np.log(self.alpha_).sum() - 0.5 * ((self.mu_ * self.mu_ + np.diagonal(S)) * self.alpha_).sum()
             ret += self.phi_.shape[1]/2
             return ret
 
@@ -182,22 +234,28 @@ class RVM(BaseEstimator):
         ksi = np.random.rand(n_objects)
 
         for it in xrange(self.n_iter):
-            S_inv = np.add(np.diag(self.alpha_), 2. * self.phi_.T.dot(np.multiply(f(ksi).reshape(-1, 1), self.phi_)))
+            S_inv = np.diag(self.alpha_) + 2. * self.phi_.T.dot(np.diag(f(ksi)).dot(self.phi_))
             S = np.linalg.inv(S_inv)
             self.mu_ = 0.5 * S.dot(self.phi_.T.dot(y))
-            # self.alpha_ = 1. / (m * m + np.diagonal(S)) 
-            self.alpha_ = np.divide(1. - np.diagonal(S) * self.alpha_, np.multiply(self.mu_, self.mu_))
+            # self.lower_bound[it] = lower_bound_(ksi, S, S_inv)
+            # self.upper_bound[it] = self._wmp()
+            # print '1', lower_bound_(ksi, S, S_inv)
+            if self.fast_opt:
+                self.alpha_ = (1. - np.diagonal(S) * self.alpha_) / (self.mu_ * self.mu_)
+            else:
+                self.alpha_ = 1. / (self.mu_ * self.mu_ + np.diagonal(S)) 
+            # print '2', lower_bound_(ksi, S, S_inv)
             for i in xrange(n_objects):
                 ksi[i] = np.sqrt(self.phi_[i].dot(self.mu_) ** 2 + self.phi_[i].dot(S).T.dot(self.phi_[i]))
-            self.lower_bound[it] = lower_bound_(ksi, S, S_inv)
-            self.upper_bound[it] = self._wmp()
             self._prune()
 
         S_inv = np.diag(self.alpha_) + 2. * self.phi_.T.dot(np.diag(f(ksi)).dot(self.phi_))
         S = np.linalg.inv(S_inv)
         self.mu_ = 0.5 * S.dot(self.phi_.T.dot(y))
+        self.sigma_ = S
+        self.lower_bound[-1] = lower_bound_(ksi, S, S_inv)
+        self.upper_bound[-1] = self._wmp()
         self.ksi = ksi
-        print lower_bound_(ksi, S, S_inv)
 
     def lb(self, w):
         ret = np.log(self.alpha_).sum() / 2
@@ -205,7 +263,7 @@ class RVM(BaseEstimator):
         ret -= (self.alpha_ * w * w).sum() / 2
         ret -= w.T.dot(self.phi_.T.dot(np.diag(f(self.ksi)).dot(self.phi_))).dot(w)
         ret += w.dot(self.phi_.T.dot(self.y)) / 2
-        ret -= np.log(np.pi)*self.phi_.shape[1] / 2
+        ret -= np.log(2 * np.pi)*self.phi_.shape[1] / 2
         return ret
 
     def ub(self, w):
@@ -213,20 +271,19 @@ class RVM(BaseEstimator):
         ret -= (self.alpha_ * w * w).sum() / 2
         ret += ((1 - self.l) * np.log(1 - self.l) + self.l * np.log(self.l)).sum()
         ret += (np.diag(self.l * self.y).dot(self.phi_).dot(w)).sum()
-        ret -= np.log(np.pi)*self.phi_.shape[1] / 2
+        ret -= np.log(2 * np.pi)*self.phi_.shape[1] / 2
         return ret 
 
     def f(self, w):
         ret = np.log(self.alpha_).sum() / 2
         ret -= (self.alpha_ * w * w).sum() / 2
         ret -= np.log(1 + np.exp(-np.diag(self.y).dot(self.phi_).dot(w))).sum()
-        ret -= np.log(np.pi)*self.phi_.shape[1] / 2
+        ret -= np.log(2 * np.pi)*self.phi_.shape[1] / 2
         return ret
 
     def fit(self, X, y):
         self.X = X
         self._fit(X, y)
-        self.w_ = self._wmp()
 
     def predict_proba(self, x):
         if self.bias_used:
